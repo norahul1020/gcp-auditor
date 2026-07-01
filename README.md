@@ -6,6 +6,10 @@ Outputs one CSV with **every finding + a Recommendation column**, plus an HTML v
 
 Columns: `scope_type, scope_id, resource_type, resource_name, category, check, finding, severity, evidence, recommendation`
 
+Two implementations, same output, same coverage:
+- `gcp_comprehensive_audit.sh` — bash, for Linux/macOS
+- `gcp_comprehensive_audit.ps1` — PowerShell, for Windows (see [Section 8](#8-windows--powershell-version))
+
 ## 1. Setup
 ```bash
 gcloud auth login
@@ -129,3 +133,72 @@ Output goes to `./gcp_audit_<timestamp>/`:
 
 ## 7. Suggested cadence
 Run weekly via cron/Cloud Scheduler + Cloud Build, diff the CSV against the previous run, and alert on any new CRITICAL/HIGH row.
+
+## 8. Windows / PowerShell version
+
+`gcp_comprehensive_audit.ps1` is a full port of the bash script — same sections (A–F), same CSV/HTML output, same finding text and recommendations. A few implementation differences worth knowing about:
+
+- **No `jq` dependency.** gcloud JSON output is parsed natively with `ConvertFrom-Json`.
+- **No `python3` dependency for HTML.** The HTML report is built directly in PowerShell.
+- **Timeout/retry logic** is reimplemented with `Start-Process` + `WaitForExit`, matching the bash version's behavior: one retry at a doubled timeout before giving up on rc=124-equivalent timeouts.
+- `bq` CLI is still required, and only required, if you set `BILLING_EXPORT_TABLE`.
+
+### Setup
+```powershell
+gcloud auth login
+gcloud auth application-default login
+# Optional, only needed for Section F billing-cost-by-service:
+gcloud components install bq
+```
+Same IAM roles and APIs as Section 2 and 3 above — nothing Windows-specific there.
+
+### Configure & run
+PowerShell's equivalent of `export VAR=value` is `$env:VAR = "value"`. Set env vars for the current session, then run the script:
+
+```powershell
+$env:ORG_ID = "123456789012"            # org-wide audit (recommended)
+# $env:FOLDER_ID = "987654321098"       # OR folder-wide
+# $env:PROJECT_ID = "my-project"        # OR single project
+# $env:PROJECTS_OVERRIDE = "proj-a proj-b proj-c"   # OR explicit list
+
+$env:SA_KEY_AGE_DAYS = "90"
+$env:SA_INACTIVITY_DAYS = "90"
+$env:LOG_LOOKBACK_DAYS = "90"
+$env:RUN_SCC_AUDIT = "true"
+$env:RUN_EXTENDED_AUDIT = "true"
+
+$env:GCLOUD_TIMEOUT = "90"
+$env:GCLOUD_TIMEOUT_LONG = "240"
+
+$env:BILLING_ACCOUNT_ID = "012345-6789AB-CDEF01"
+$env:ACCESS_POLICY_ID = "123456789"
+
+$env:BILLING_EXPORT_TABLE = "my-project.billing_dataset.gcp_billing_export_v1_XXXXXX"
+$env:BILLING_LOOKBACK_DAYS = "30"
+
+.\gcp_comprehensive_audit.ps1
+```
+
+To make env vars persist across terminal sessions (rather than just the current one), use `setx` (takes effect in *new* terminals) or add the `$env:VAR = "..."` lines to your PowerShell `$PROFILE`:
+```powershell
+setx ORG_ID "123456789012"
+```
+
+Output goes to `.\gcp_audit_<timestamp>\` (or wherever `$env:OUTPUT_DIR` points), with the same `gcp_audit_report.csv`, `gcp_audit_report.html`, `raw\`, and `run.log` as the bash version.
+
+### Running against multiple projects in parallel
+The script loops over `PROJECTS_OVERRIDE` sequentially by default. To audit several projects concurrently, run separate instances of the script with their own `PROJECT_ID`/`OUTPUT_DIR`, either via PowerShell 7's `ForEach-Object -Parallel` or via `Start-Job` on PowerShell 5.1. Each parallel run needs its **own `OUTPUT_DIR`** so they don't race on the same CSV/log files, and a modest throttle (3–5 concurrent) avoids GCP API rate-limit errors.
+
+```powershell
+# PowerShell 7+
+$projects = @("project-a", "project-b", "project-c")
+$projects | ForEach-Object -Parallel {
+    $env:PROJECT_ID = $_
+    $env:OUTPUT_DIR = ".\gcp_audit_$_"
+    & "C:\path\to\gcp_comprehensive_audit.ps1"
+} -ThrottleLimit 3
+```
+
+### Known differences from the bash version
+- All limitations in Section 6 (timeouts being transient, rc≠0 usually meaning API-disabled/permission-denied, folder discovery not recursing into sub-folders, secret regex having false positives/negatives, SCC needing to be enabled, etc.) apply identically to the PowerShell version — the underlying `gcloud` calls and logic are the same, only the scripting language differs.
+- Windows Defender / some corporate endpoint tools may flag or slow down a large PowerShell script making many outbound API calls; if the script seems to hang, check `run.log` first before assuming it's stuck.
